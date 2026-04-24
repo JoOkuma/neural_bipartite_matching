@@ -11,8 +11,10 @@ import pytest
 
 from neural_bipartite_matching import (
     MatchingConfig,
+    matched_pairs,
     matching_weight,
     neural_match,
+    to_permutation,
 )
 
 torch = pytest.importorskip("torch", reason="torch backend not installed")
@@ -354,6 +356,76 @@ def test_top_level_auto_dispatch_on_numpy_input():
 def test_config_validation(field, value):
     with pytest.raises(ValueError):
         MatchingConfig(**{field: value})
+
+
+# ---------------------------------------------------------------------------
+# Matching → pairs / permutation helpers
+# ---------------------------------------------------------------------------
+
+
+def test_matched_pairs_scipy_compatible():
+    """``matched_pairs`` yields scipy-style ``(row_ind, col_ind)`` usable
+    to index the weight matrix directly."""
+    scipy_opt = pytest.importorskip("scipy.optimize")
+    rng = np.random.default_rng(40)
+    A = rng.random((6, 6)) + 0.1
+    res = neural_match(A, alpha=0.001, max_iter=10_000, convergence="weights")
+    row_ind, col_ind = matched_pairs(res.matching)
+    assert row_ind.shape == col_ind.shape == (6,)
+    assert row_ind.dtype == col_ind.dtype == np.int64
+    # Total weight via pair indexing matches the helper's own sum.
+    w_pairs = float(A[row_ind, col_ind].sum())
+    assert abs(w_pairs - matching_weight(A, res.matching)) < 1e-12
+    # scipy returns pairs sorted by row; ours are sorted by col. Sort both
+    # by row before comparing.
+    order = np.argsort(row_ind)
+    ri_sorted, ci_sorted = row_ind[order], col_ind[order]
+    sci_r, sci_c = scipy_opt.linear_sum_assignment(A, maximize=True)
+    # Not required to equal the Hungarian solution, but must be a valid
+    # 1-to-1 pairing of the same length.
+    assert set(ri_sorted.tolist()) == set(sci_r.tolist())
+    assert set(ci_sorted.tolist()) == set(sci_c.tolist())
+
+
+def test_matched_pairs_rectangular_drops_unmatched():
+    """In 1-to-many, unmatched fibers are filtered out."""
+    # Hand-crafted matching with a -1 entry:
+    matching = np.array([2, -1, 0, 0, 1], dtype=np.int32)
+    row_ind, col_ind = matched_pairs(matching)
+    assert row_ind.tolist() == [2, 0, 0, 1]
+    assert col_ind.tolist() == [0, 2, 3, 4]
+
+
+def test_to_permutation_roundtrip():
+    """For a 1-to-1 matching, ``to_permutation`` inverts the fiber->neuron
+    encoding: ``perm[i] = j`` iff ``matching[j] = i``."""
+    # Hand-built 1-to-1 matching so the test is isolated from algorithm
+    # convergence quirks: neuron 0<->fiber 2, 1<->0, 2<->3, 3<->1.
+    matching = np.array([1, 3, 0, 2], dtype=np.int64)
+    perm = to_permutation(matching)
+    assert perm.tolist() == [2, 0, 3, 1]
+    # Round-trip: rebuild the fiber->neuron array from perm.
+    reconstructed = np.empty(4, dtype=np.int64)
+    reconstructed[perm] = np.arange(4)
+    assert reconstructed.tolist() == matching.tolist()
+
+    # Also exercise on a real algorithm output that is a clean permutation
+    # (dominant diagonal input makes this deterministic).
+    rng = np.random.default_rng(42)
+    n = 6
+    A = 0.01 * rng.random((n, n)) + np.eye(n)
+    res = neural_match(A, alpha=0.01, max_iter=5000)
+    perm = to_permutation(res.matching)
+    assert perm.tolist() == list(range(n))
+
+
+def test_to_permutation_rejects_non_bijective():
+    # Unmatched fiber -> not a permutation.
+    with pytest.raises(ValueError, match="unmatched"):
+        to_permutation(np.array([0, 1, -1, 2]))
+    # Same neuron appears twice -> not a permutation.
+    with pytest.raises(ValueError, match="1-to-1"):
+        to_permutation(np.array([0, 1, 1, 2]))
 
 
 def test_backends_agree():

@@ -14,14 +14,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._core import MatchingConfig, MatchingResult, matching_weight
+from ._core import (
+    MatchingConfig,
+    MatchingResult,
+    matched_pairs,
+    matching_weight,
+    to_permutation,
+)
 
 __all__ = [
     "MatchingConfig",
     "MatchingResult",
+    "available_backends",
+    "matched_pairs",
     "matching_weight",
     "neural_match",
-    "available_backends",
+    "to_permutation",
 ]
 
 

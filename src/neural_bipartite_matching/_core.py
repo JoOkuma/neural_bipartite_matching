@@ -249,6 +249,57 @@ class MatchingResult:
     converged: bool
 
 
+def matched_pairs(matching):
+    """Return matched edges as ``(row_ind, col_ind)`` int arrays.
+
+    The output mirrors :func:`scipy.optimize.linear_sum_assignment`:
+    ``row_ind[k]`` is the neuron matched to fiber ``col_ind[k]``, and the
+    set of matched edges is ``zip(row_ind, col_ind)``. Works for both
+    1-to-1 and 1-to-many matchings; unmatched fibers (``matching[j] ==
+    -1``) are dropped.
+
+    Examples
+    --------
+    >>> res = neural_match(A)
+    >>> row_ind, col_ind = matched_pairs(res.matching)
+    >>> total_weight = float(A[row_ind, col_ind].sum())
+    """
+    import numpy as np
+
+    matching = np.asarray(matching)
+    col_ind = np.flatnonzero(matching >= 0)
+    row_ind = matching[col_ind]
+    return row_ind.astype(np.int64, copy=False), col_ind.astype(np.int64, copy=False)
+
+
+def to_permutation(matching):
+    """Return the neuron-to-fiber permutation of a 1-to-1 matching.
+
+    For a square matching (``N == M``) where every neuron is paired with
+    exactly one distinct fiber, returns the integer array ``perm`` of
+    length ``N`` such that::
+
+        perm[i] = j    iff    neuron i is matched to fiber j
+
+    (i.e. ``perm`` is the inverse of the ``matching[j] = i`` encoding).
+    Raises :class:`ValueError` if the matching is not bijective.
+    """
+    import numpy as np
+
+    matching = np.asarray(matching)
+    M = matching.shape[0]
+    if (matching < 0).any():
+        raise ValueError("matching contains unmatched fibers; not a permutation")
+    counts = np.bincount(matching, minlength=M)
+    if counts.size != M or not np.all(counts == 1):
+        raise ValueError(
+            "matching is not 1-to-1: every neuron must appear in exactly one fiber"
+        )
+    perm = np.empty(M, dtype=np.int64)
+    perm[matching] = np.arange(M, dtype=np.int64)
+    return perm
+
+
 def matching_weight(A0, matching) -> float:
     """Total weight of a matching, summed over the original weights ``A0``.
 
@@ -261,9 +312,7 @@ def matching_weight(A0, matching) -> float:
     """
     import numpy as np
 
-    A0 = np.asarray(A0)
-    matching = np.asarray(matching)
-    js = np.where(matching >= 0)[0]
-    if js.size == 0:
+    row_ind, col_ind = matched_pairs(matching)
+    if row_ind.size == 0:
         return 0.0
-    return float(A0[matching[js], js].sum())
+    return float(np.asarray(A0)[row_ind, col_ind].sum())
