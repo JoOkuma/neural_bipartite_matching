@@ -1,7 +1,16 @@
-"""JAX implementation of the neural bipartite matching algorithm."""
+"""JAX implementation of the neural bipartite matching algorithm.
+
+The entire iteration loop — including the convergence check, optional
+resolution of multi-matched fibers, and extraction of the final
+``matching`` vector — is compiled inside a single :func:`jax.jit`'ed
+function driven by :func:`jax.lax.while_loop`. This avoids per-iteration
+host/device synchronization and lets the whole call be composed with
+further ``jit`` / ``vmap`` / ``pmap`` transforms from the caller.
+"""
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 try:
@@ -51,6 +60,10 @@ def _reallocate(
     raise ValueError(f"Unknown realloc type: {realloc!r}")
 
 
+def _step(A, f, alpha, R, beta, realloc):
+    return _reallocate(_competition(A, f, alpha), f, R, beta, realloc)
+
+
 def _resolve_triangles(A: jnp.ndarray) -> jnp.ndarray:
     active = A > 0
     masked = jnp.where(active, A, -jnp.inf)
@@ -69,9 +82,47 @@ def _extract_matching(A: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(any_active, idx, -1).astype(jnp.int32)
 
 
-def _step(A, f, alpha, R, beta, realloc):
-    A_prime = _competition(A, f, alpha)
-    return _reallocate(A_prime, f, R, beta, realloc)
+@partial(
+    jax.jit,
+    static_argnames=("realloc", "normalize_input", "resolve"),
+)
+def _run(
+    A: jnp.ndarray,
+    f: jnp.ndarray,
+    alpha: float,
+    beta: float,
+    R: float,
+    tol: float,
+    max_iter: int,
+    realloc: RellocType,
+    normalize_input: bool,
+    resolve: bool,
+):
+    """Fully compiled matching loop. All arguments except the three static
+    ones may be traced; ``max_iter`` is passed as a traced scalar, so
+    changing its value does not trigger recompilation."""
+    if normalize_input:
+        A = _row_normalize(A, (R / f)[:, None])
+
+    def body(carry):
+        A_prev, _prev_prev, i, _done = carry
+        A_new = _step(A_prev, f, alpha, R, beta, realloc)
+        diff = jnp.max(jnp.abs(A_new - A_prev))
+        support_eq = jnp.all((A_new > 0) == (A_prev > 0))
+        done_new = (diff < tol) & support_eq
+        return (A_new, A_prev, i + 1, done_new)
+
+    def cond(carry):
+        _A, _prev, i, done = carry
+        return (~done) & (i < max_iter)
+
+    init = (A, A, jnp.int32(0), jnp.bool_(False))
+    A_final, _prev, iters, converged = jax.lax.while_loop(cond, body, init)
+
+    if resolve:
+        A_final = _resolve_triangles(A_final)
+    matching = _extract_matching(A_final)
+    return A_final, matching, iters, converged
 
 
 def neural_match(
@@ -82,16 +133,19 @@ def neural_match(
 ) -> MatchingResult:
     """Run the neural bipartite matching algorithm (JAX backend).
 
-    See :func:`neural_bipartite_matching.torch_backend.neural_match` for
-    the full parameter documentation. This backend otherwise mirrors it.
+    The entire iteration — competition, reallocation, convergence check,
+    optional triangle resolution, and matching extraction — runs inside a
+    single JIT-compiled function.
     """
     if config is None:
         config = MatchingConfig(**kwargs)
     elif kwargs:
         config = MatchingConfig(**{**config.__dict__, **kwargs})
 
-    A_j = jnp.asarray(A, dtype=jnp.float32 if jnp.asarray(A).dtype.kind != "f" else None)
-    A_j = jnp.asarray(A_j, dtype=jnp.result_type(A_j, jnp.float32))
+    A_j = jnp.asarray(A)
+    if not jnp.issubdtype(A_j.dtype, jnp.floating):
+        A_j = A_j.astype(jnp.float32)
+    # Validation runs eagerly so errors surface before compilation.
     if (A_j < 0).any():
         raise ValueError("Input weight matrix must be non-negative.")
     N, M = A_j.shape
@@ -107,29 +161,22 @@ def neural_match(
         if (f_j <= 0).any():
             raise ValueError("Firing rates f must be strictly positive.")
 
-    budget = (config.R / f_j)[:, None]
-    if config.normalize_input:
-        A_j = _row_normalize(A_j, budget)
-
-    # JIT a single step; python-level loop for convergence check.
-    step = jax.jit(
-        lambda X: _step(X, f_j, config.alpha, config.R, config.beta, config.realloc)
+    A_final, matching, iters, converged = _run(
+        A_j,
+        f_j,
+        jnp.asarray(config.alpha, dtype=A_j.dtype),
+        jnp.asarray(config.beta, dtype=A_j.dtype),
+        jnp.asarray(config.R, dtype=A_j.dtype),
+        jnp.asarray(config.tol, dtype=A_j.dtype),
+        jnp.int32(config.max_iter),
+        config.realloc,
+        config.normalize_input,
+        config.resolve,
     )
 
-    converged = False
-    iterations = 0
-    for t in range(1, config.max_iter + 1):
-        iterations = t
-        prev = A_j
-        A_j = step(prev)
-        diff = float(jnp.max(jnp.abs(A_j - prev)))
-        support_change = bool(jnp.any((A_j > 0) != (prev > 0)))
-        if diff < config.tol and not support_change:
-            converged = True
-            break
-
-    if config.resolve:
-        A_j = _resolve_triangles(A_j)
-
-    matching = _extract_matching(A_j)
-    return MatchingResult(A=A_j, matching=matching, iterations=iterations, converged=converged)
+    return MatchingResult(
+        A=A_final,
+        matching=matching,
+        iterations=int(iters),
+        converged=bool(converged),
+    )
