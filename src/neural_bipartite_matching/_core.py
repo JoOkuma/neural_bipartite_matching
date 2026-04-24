@@ -201,6 +201,26 @@ class MatchingConfig:
     add_noise: bool = False
     seed: int | None = None
 
+    def __post_init__(self) -> None:
+        if self.alpha <= 0:
+            raise ValueError(f"alpha must be > 0, got {self.alpha}")
+        if not (0 < self.beta <= 1):
+            raise ValueError(f"beta must be in (0, 1], got {self.beta}")
+        if self.R <= 0:
+            raise ValueError(f"R must be > 0, got {self.R}")
+        if self.tol <= 0:
+            raise ValueError(f"tol must be > 0, got {self.tol}")
+        if self.max_iter is not None and self.max_iter <= 0:
+            raise ValueError(f"max_iter must be > 0 or None, got {self.max_iter}")
+        if self.realloc not in ("multiplicative", "constant"):
+            raise ValueError(
+                f"realloc must be 'multiplicative' or 'constant', got {self.realloc!r}"
+            )
+        if self.convergence not in ("structural", "weights"):
+            raise ValueError(
+                f"convergence must be 'structural' or 'weights', got {self.convergence!r}"
+            )
+
     def resolved_max_iter(self) -> int:
         """Return ``max_iter``, defaulting to ``int(10 / alpha)``."""
         return self.max_iter if self.max_iter is not None else int(10 / self.alpha)

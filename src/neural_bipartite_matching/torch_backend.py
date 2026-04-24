@@ -198,7 +198,12 @@ def neural_match(
     elif kwargs:
         config = MatchingConfig(**{**config.__dict__, **kwargs})
 
-    A_t = torch.as_tensor(A, dtype=torch.get_default_dtype())
+    # Preserve the input's floating dtype; only cast integer/bool inputs
+    # to the default dtype. This avoids silently truncating a float64
+    # tensor when ``torch.get_default_dtype()`` is float32.
+    A_t = torch.as_tensor(A)
+    if not A_t.is_floating_point():
+        A_t = A_t.to(torch.get_default_dtype())
     if (A_t < 0).any():
         raise ValueError("Input weight matrix must be non-negative.")
     N, M = A_t.shape

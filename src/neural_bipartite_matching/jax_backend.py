@@ -12,6 +12,7 @@ transforms from the caller.
 
 from __future__ import annotations
 
+import secrets
 from functools import partial
 from typing import Any
 
@@ -177,8 +178,13 @@ def _apply_noise(A: jnp.ndarray, seed: int | None) -> jnp.ndarray:
     """Symmetry-breaking perturbation::
 
         A_ij <- A_ij * (1 + u_ij),    u_ij ~ Uniform(0.01, 0.05)
+
+    With ``seed=None`` the key is drawn from OS entropy, so the noise
+    is non-deterministic — matching the torch backend's behaviour.
     """
-    key = jax.random.PRNGKey(0 if seed is None else int(seed))
+    if seed is None:
+        seed = secrets.randbits(32)
+    key = jax.random.PRNGKey(int(seed))
     u = jax.random.uniform(key, A.shape, A.dtype, minval=0.01, maxval=0.05)
     return A + A * u
 

@@ -111,6 +111,65 @@ def test_pruned_edges_stay_pruned(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+def test_partial_reallocation_beta(backend):
+    """With ``beta < 1`` the algorithm still finds a valid matching, and
+    the row-sum invariant ``sum_j A_ij = R/f_i`` is reached asymptotically
+    (a convex combination ``(1-beta)*S + beta*(R/f)`` per step)."""
+    rng = np.random.default_rng(30)
+    A = rng.random((4, 12)) + 0.1
+    res = _run(backend, A, alpha=0.001, beta=0.5, max_iter=20_000, resolve=False)
+    final = _as_numpy(res.A)
+    # Valid 1-to-many structure (each fiber has exactly one incident edge).
+    assert ((final > 0).sum(axis=0) == 1).all()
+    # Row budget not exceeded, and reached (up to tolerance) on rows with
+    # surviving edges — R/f_i = 1.0 here.
+    row_sums = final.sum(axis=1)
+    assert np.all(row_sums <= 1.0 + 1e-6)
+    assert np.all(row_sums[row_sums > 0] > 1.0 - 1e-3)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_normalize_input_false_matches_prenormalized(backend):
+    """Pre-normalizing the input and passing ``normalize_input=False``
+    must produce the same result as letting the algorithm normalize."""
+    rng = np.random.default_rng(31)
+    A = rng.random((4, 10)) + 0.1
+    R = 1.0
+    # Reference: algorithm normalizes internally.
+    r_auto = _run(backend, A, R=R, alpha=0.001, max_iter=5000)
+    # Same input, hand-normalized, passed through with normalize_input=False.
+    A_pre = A / A.sum(axis=1, keepdims=True) * R
+    r_manual = _run(
+        backend, A_pre, R=R, alpha=0.001, max_iter=5000, normalize_input=False
+    )
+    assert _as_numpy(r_auto.matching).tolist() == _as_numpy(r_manual.matching).tolist()
+    np.testing.assert_allclose(_as_numpy(r_auto.A), _as_numpy(r_manual.A), atol=1e-10)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_resolve_false_returns_raw_fixed_point(backend):
+    """With ``resolve=False`` the returned matrix is the untouched fixed
+    point of the iteration: at structural convergence it already encodes
+    a valid matching (no leftover triangles), with full-budget row sums."""
+    rng = np.random.default_rng(32)
+    A = rng.random((5, 15)) + 0.1
+    res = _run(backend, A, alpha=0.001, max_iter=20_000, resolve=False)
+    assert res.converged
+    final = _as_numpy(res.A)
+    # Structural validity already holds pre-resolve (that's what
+    # convergence="structural" waits for).
+    assert ((final > 0).sum(axis=0) == 1).all()
+    # And the beta=1 row-sum invariant holds exactly.
+    np.testing.assert_allclose(final.sum(axis=1), 1.0, atol=1e-10)
+    # Matching recovered from the raw matrix matches the post-resolve one.
+    res_resolved = _run(backend, A, alpha=0.001, max_iter=20_000, resolve=True)
+    assert (
+        _as_numpy(res.matching).tolist()
+        == _as_numpy(res_resolved.matching).tolist()
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_row_budget_respected(backend):
     """Row sums must not exceed R/f_i at convergence (constraint in eq. 1 of suppl.)."""
     rng = np.random.default_rng(4)
@@ -259,6 +318,42 @@ def test_add_noise_breaks_symmetry(backend):
     # Reproducible under a fixed seed.
     again = _run(backend, A, alpha=0.01, max_iter=5000, add_noise=True, seed=0)
     assert _as_numpy(again.matching).tolist() == m_yes.tolist()
+
+
+# ---------------------------------------------------------------------------
+# Dispatch and configuration
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_auto_dispatch_on_numpy_input():
+    """`neural_match` with a numpy array picks the first available backend."""
+    from neural_bipartite_matching import available_backends
+
+    assert set(available_backends()) >= {"torch", "jax"}  # sanity for this env
+    rng = np.random.default_rng(20)
+    A = rng.random((3, 8)) + 0.1
+    res = neural_match(A, alpha=0.01)  # plain numpy -> auto-select
+    _assert_valid_matching(A, res.matching)
+    assert (_as_numpy(res.matching) >= 0).all()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("alpha", 0.0),
+        ("alpha", -0.1),
+        ("beta", 0.0),
+        ("beta", 1.5),
+        ("R", 0.0),
+        ("tol", 0.0),
+        ("max_iter", 0),
+        ("realloc", "weird"),
+        ("convergence", "weird"),
+    ],
+)
+def test_config_validation(field, value):
+    with pytest.raises(ValueError):
+        MatchingConfig(**{field: value})
 
 
 def test_backends_agree():
