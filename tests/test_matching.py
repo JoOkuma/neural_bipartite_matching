@@ -82,9 +82,11 @@ def test_near_optimal_efficiency(backend):
     """Neural matching should be within a few percent of the Hungarian optimum."""
     scipy_opt = pytest.importorskip("scipy.optimize")
     rng = np.random.default_rng(2)
-    n = 10
+    n = 30
     A = rng.lognormal(size=(n, n))
-    res = _run(backend, A, alpha=0.001, max_iter=5000)
+    # Use weight convergence here: tighter stopping rule -> the matching
+    # has more iterations to settle toward a high-efficiency fixed point.
+    res = _run(backend, A, alpha=0.001, max_iter=10_000, convergence="weights")
     neural_w = matching_weight(A, _as_numpy(res.matching))
     ri, ci = scipy_opt.linear_sum_assignment(A, maximize=True)
     opt_w = float(A[ri, ci].sum())
@@ -188,6 +190,75 @@ def test_rejects_negative_weights(backend):
     A = np.array([[1.0, -0.1], [0.2, 0.3]])
     with pytest.raises(ValueError):
         _run(backend, A)
+
+
+# ---------------------------------------------------------------------------
+# Parity with the authors' reference implementation behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_one_to_one_cleanup(backend):
+    """When N == M, every neuron must also end up with exactly one fiber."""
+    rng = np.random.default_rng(10)
+    n = 6
+    A = rng.random((n, n)) + 0.1
+    res = _run(backend, A, alpha=0.001, max_iter=5000)
+    matching = _as_numpy(res.matching)
+    # every fiber matched...
+    assert (matching >= 0).all()
+    # ...to a distinct neuron (permutation).
+    assert sorted(matching.tolist()) == list(range(n))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_structural_converges_earlier_than_weights(backend):
+    """Structural convergence (the reference impl's criterion) terminates
+    no later than weight convergence, and usually earlier."""
+    rng = np.random.default_rng(11)
+    A = rng.random((5, 15)) + 0.1
+    r_struct = _run(backend, A, alpha=0.001, convergence="structural", max_iter=20_000)
+    r_weight = _run(backend, A, alpha=0.001, convergence="weights", max_iter=20_000)
+    assert r_struct.converged and r_weight.converged
+    assert r_struct.iterations <= r_weight.iterations
+    # Matchings should agree regardless of criterion.
+    assert _as_numpy(r_struct.matching).tolist() == _as_numpy(r_weight.matching).tolist()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_default_max_iter_scales_with_alpha(backend):
+    """max_iter=None should default to int(10/alpha), letting small alpha
+    runs converge without the user thinking about it."""
+    rng = np.random.default_rng(12)
+    A = rng.random((4, 12)) + 0.1
+    # alpha=0.001 -> default 10_000 iters, plenty for this small problem.
+    res = _run(backend, A, alpha=0.001)
+    assert res.converged
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_add_noise_breaks_symmetry(backend):
+    """With perfectly tied rows the symmetric competition cannot separate
+    the two neurons, so one ends up unmatched. Injecting the tiny
+    multiplicative noise from the reference implementation breaks the
+    symmetry and produces a fair matching."""
+    A = np.ones((2, 4))
+    no_noise = _run(backend, A, alpha=0.01, max_iter=5000, add_noise=False)
+    with_noise = _run(backend, A, alpha=0.01, max_iter=5000, add_noise=True, seed=0)
+
+    # Without noise: argmax tie-breaks hand every fiber to the same neuron.
+    m_no = _as_numpy(no_noise.matching)
+    assert len(set(m_no.tolist())) == 1, m_no
+
+    # With noise: both neurons get at least one fiber (fair matching).
+    m_yes = _as_numpy(with_noise.matching)
+    _assert_valid_matching(A, m_yes)
+    assert (m_yes >= 0).all()
+    assert set(m_yes.tolist()) == {0, 1}
+
+    # Reproducible under a fixed seed.
+    again = _run(backend, A, alpha=0.01, max_iter=5000, add_noise=True, seed=0)
+    assert _as_numpy(again.matching).tolist() == m_yes.tolist()
 
 
 def test_backends_agree():

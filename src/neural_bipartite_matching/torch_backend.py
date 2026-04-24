@@ -1,4 +1,9 @@
-"""PyTorch implementation of the neural bipartite matching algorithm."""
+"""PyTorch implementation of the neural bipartite matching algorithm.
+
+Implements the competition / reallocation update described in
+:mod:`neural_bipartite_matching._core`. All operations are vectorized
+over the ``N x M`` weight matrix; there are no Python inner loops.
+"""
 
 from __future__ import annotations
 
@@ -12,21 +17,29 @@ except ImportError as e:  # pragma: no cover - exercised via import guard
         "`pip install neural-bipartite-matching[torch]`."
     ) from e
 
-from ._core import MatchingConfig, MatchingResult, RellocType
+from ._core import ConvergenceType, MatchingConfig, MatchingResult, RellocType
 
 
 def _row_normalize(A: torch.Tensor, budget: torch.Tensor) -> torch.Tensor:
+    """Rescale rows so that ``sum_j A_ij = budget_i = R / f_i``.
+
+    Empty rows (all zeros) are left untouched.
+    """
     row_sum = A.sum(dim=1, keepdim=True)
-    # leave empty rows untouched
     safe = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
     return torch.where(row_sum > 0, A * (budget / safe), A)
 
 
 def _competition(A: torch.Tensor, f: torch.Tensor, alpha: float) -> torch.Tensor:
-    # total input into each fiber j: sum_k f_k A_kj
-    total = (f.unsqueeze(1) * A).sum(dim=0, keepdim=True)  # (1, M)
-    # competitors for (i, j): total_j - f_i * A_ij
-    competitors = total - f.unsqueeze(1) * A
+    """Competition step (paper Eq. 1)::
+
+        A'_ij = max( A_ij - alpha * sum_{k != i} f_k * A_kj , 0 )
+              = max( A_ij - alpha * ( T_j - f_i * A_ij ) ,  0 )
+
+    where ``T_j = sum_k f_k * A_kj`` is the total input to fiber ``j``.
+    """
+    total = (f.unsqueeze(1) * A).sum(dim=0, keepdim=True)  # (1, M) = T_j
+    competitors = total - f.unsqueeze(1) * A               # T_j - f_i * A_ij
     return torch.clamp(A - alpha * competitors, min=0.0)
 
 
@@ -37,11 +50,25 @@ def _reallocate(
     beta: float,
     realloc: RellocType,
 ) -> torch.Tensor:
-    budget = (R / f).unsqueeze(1)  # (N, 1)
-    row_sum = A.sum(dim=1, keepdim=True)
-    retracted = torch.clamp(budget - row_sum, min=0.0)
+    """Reallocation step, applied to the post-competition matrix ``A'``.
+
+    Let ``S_i = sum_{j'} A'_ij'`` and ``retract_i = R/f_i - S_i``.
+
+    Multiplicative (paper Eq. 2)::
+
+        A_new_ij = A'_ij + beta * retract_i * A'_ij / S_i
+
+    Constant (paper Eq. 3), with ``d_i`` = active degree of neuron ``i``::
+
+        A_new_ij = A'_ij + beta * retract_i / d_i   if A'_ij > 0
+                 = 0                                if A'_ij = 0
+
+    Zero entries stay zero in both rules, so pruned edges never reappear.
+    """
+    budget = (R / f).unsqueeze(1)  # (N, 1) = R / f_i
+    row_sum = A.sum(dim=1, keepdim=True)              # S_i
+    retracted = torch.clamp(budget - row_sum, min=0.0)  # retract_i
     if realloc == "multiplicative":
-        # proportional redistribution; zero rows are left untouched
         safe = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
         frac = torch.where(row_sum > 0, A / safe, torch.zeros_like(A))
         return A + beta * retracted * frac
@@ -53,21 +80,66 @@ def _reallocate(
     raise ValueError(f"Unknown realloc type: {realloc!r}")
 
 
-def _resolve_triangles(A: torch.Tensor) -> torch.Tensor:
-    """Keep at most one incident edge per fiber (the largest)."""
-    if A.numel() == 0:
+def _apply_noise(A: torch.Tensor, seed: int | None) -> torch.Tensor:
+    """Symmetry-breaking perturbation used by the reference implementation::
+
+        A_ij <- A_ij * (1 + u_ij),    u_ij ~ Uniform(0.01, 0.05)
+
+    This is applied to the raw input *before* row-normalization so that
+    neurons with identical rows no longer have perfectly tied dynamics.
+    """
+    gen = torch.Generator(device=A.device)
+    if seed is not None:
+        gen.manual_seed(int(seed))
+    u = torch.empty_like(A).uniform_(0.01, 0.05, generator=gen)
+    return A + A * u
+
+
+def _structural_converged(A: torch.Tensor, one_to_one: bool) -> bool:
+    """True when the current matrix encodes a valid matching::
+
+        (A > 0).sum(axis=0) == 1  for every fiber j,
+
+    and, if ``one_to_one`` (i.e. ``N == M``), also::
+
+        (A > 0).sum(axis=1) == 1  for every neuron i.
+    """
+    col_ok = ((A > 0).sum(dim=0) == 1).all().item()
+    if not col_ok:
+        return False
+    if one_to_one:
+        return ((A > 0).sum(dim=1) == 1).all().item()
+    return True
+
+
+def _resolve_triangles(A: torch.Tensor, one_to_one: bool) -> torch.Tensor:
+    """Prune so each fiber has at most one incident edge (and each neuron
+    too, when ``one_to_one``). Ties broken by keeping the max-weight edge.
+    """
+    if A.numel() == 0 or not (A > 0).any():
         return A
-    # per-column argmax among strictly positive entries
+
+    if one_to_one:
+        # First pass: keep only the max-weight fiber per neuron.
+        active = A > 0
+        masked = torch.where(active, A, torch.full_like(A, float("-inf")))
+        row_winners = masked.argmax(dim=1)  # (N,)
+        keep = torch.zeros_like(A, dtype=torch.bool)
+        rows = torch.arange(A.shape[0], device=A.device)
+        keep[rows, row_winners] = True
+        keep &= active
+        A = torch.where(keep, A, torch.zeros_like(A))
+
+    # Second pass: keep only the max-weight neuron per fiber.
     active = A > 0
     if not active.any():
         return A
-    # mask non-positive entries with -inf so they never win
     masked = torch.where(active, A, torch.full_like(A, float("-inf")))
-    winners = masked.argmax(dim=0)  # (M,)
+    col_winners = masked.argmax(dim=0)  # (M,)
     keep = torch.zeros_like(A, dtype=torch.bool)
     cols = torch.arange(A.shape[1], device=A.device)
-    keep[winners, cols] = True
-    keep &= active  # columns with no active entries stay unmatched
+    keep[col_winners, cols] = True
+    keep &= active
     return torch.where(keep, A, torch.zeros_like(A))
 
 
@@ -81,6 +153,25 @@ def _extract_matching(A: torch.Tensor) -> torch.Tensor:
         idx = masked.argmax(dim=0)
         matching = torch.where(any_active, idx.to(torch.long), matching)
     return matching
+
+
+def _check_convergence(
+    A: torch.Tensor,
+    prev: torch.Tensor,
+    mode: ConvergenceType,
+    tol: float,
+    one_to_one: bool,
+) -> bool:
+    # Safety net common to both modes: weights did not change at all.
+    if torch.equal(A, prev):
+        return True
+    if mode == "structural":
+        return _structural_converged(A, one_to_one)
+    # "weights"
+    diff = (A - prev).abs().max().item()
+    if diff >= tol:
+        return False
+    return not ((A > 0) != (prev > 0)).any().item()
 
 
 def neural_match(
@@ -101,10 +192,6 @@ def neural_match(
     config
         Optional :class:`MatchingConfig`. Any keyword argument overrides
         the corresponding field.
-
-    Returns
-    -------
-    MatchingResult
     """
     if config is None:
         config = MatchingConfig(**kwargs)
@@ -117,6 +204,7 @@ def neural_match(
     N, M = A_t.shape
     if N > M:
         raise ValueError(f"Expected N <= M, got N={N}, M={M}.")
+    one_to_one = N == M
 
     if f is None:
         f_t = torch.ones(N, dtype=A_t.dtype, device=A_t.device)
@@ -127,25 +215,27 @@ def neural_match(
         if (f_t <= 0).any():
             raise ValueError("Firing rates f must be strictly positive.")
 
+    if config.add_noise:
+        A_t = _apply_noise(A_t, config.seed)
+
     budget = (config.R / f_t).unsqueeze(1)
     if config.normalize_input:
         A_t = _row_normalize(A_t, budget)
 
+    max_iter = config.resolved_max_iter()
     converged = False
     iterations = 0
-    for t in range(1, config.max_iter + 1):
+    for t in range(1, max_iter + 1):
         iterations = t
         prev = A_t
         A_prime = _competition(A_t, f_t, config.alpha)
         A_t = _reallocate(A_prime, f_t, config.R, config.beta, config.realloc)
-        diff = (A_t - prev).abs().max().item()
-        support_change = ((A_t > 0) != (prev > 0)).any().item()
-        if diff < config.tol and not support_change:
+        if _check_convergence(A_t, prev, config.convergence, config.tol, one_to_one):
             converged = True
             break
 
     if config.resolve:
-        A_t = _resolve_triangles(A_t)
+        A_t = _resolve_triangles(A_t, one_to_one)
 
     matching = _extract_matching(A_t)
     return MatchingResult(A=A_t, matching=matching, iterations=iterations, converged=converged)
