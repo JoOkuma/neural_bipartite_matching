@@ -6,6 +6,8 @@ readme = "README.md"
 authors = [
     { name = "Jordao Bragantini", email = "jordao.bragantini@czbiohub.org" }
 ]
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.24",
